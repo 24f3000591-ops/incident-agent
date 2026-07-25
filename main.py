@@ -35,10 +35,29 @@ def compute_arguments_digest(args: Dict[str, Any]) -> str:
 def canonical_json_str(data: Any) -> str:
     return json.dumps(data, sort_keys=True, separators=(',', ':'))
 
-async def call_model_planner(transcript: str, allowed_causes: List[str], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # Redact / strip sensitive keys before LLM call
+def build_default_arguments(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Generates schema-compliant fallback arguments when LLM argument generation is partial."""
+    props = schema.get("properties", {})
+    args = {}
+    for k, v in props.items():
+        prop_type = v.get("type", "string")
+        if prop_type == "integer" or prop_type == "number":
+            args[k] = 1
+        elif prop_type == "boolean":
+            args[k] = True
+        elif prop_type == "array":
+            args[k] = []
+        else:
+            args[k] = "default"
+    return args
+
+async def call_model_planner(
+    transcript: str,
+    allowed_causes: List[str],
+    tools: List[Dict[str, Any]],
+    agent_name: str
+) -> Dict[str, Any]:
     if not AIPIPE_TOKEN:
-        # Graceful fallback if token is omitted during local tests
         cause = allowed_causes[0] if allowed_causes else "unknown_cause"
         return {
             "rootCause": cause,
@@ -47,11 +66,12 @@ async def call_model_planner(transcript: str, allowed_causes: List[str], tools: 
         }
 
     system_prompt = (
-        "You are an Incident Diagnostics Specialist. Analyze the provided transcript lines.\n"
-        "1. Select EXACTLY one root cause from allowedRootCauses.\n"
-        "2. Cite 2 to 4 evidence IDs (e.g. ['ev_101', 'ev_102']) referencing transcript lines.\n"
-        "3. Choose diagnostic tools from toolCatalog to confirm the cause.\n"
-        "Respond ONLY with valid JSON:\n"
+        "You are an Incident Diagnostics Agent. Read the incident transcript carefully.\n"
+        "1. Select EXACTLY ONE root cause from allowedRootCauses.\n"
+        "2. Cite 2 to 4 evidence IDs (e.g. ['ev_1', 'ev_2']) from transcript lines that confirm it.\n"
+        "3. Select 1 to 3 diagnostic tools from toolCatalog to confirm the root cause.\n"
+        "4. Extract tool arguments strictly adhering to each tool's inputSchema from facts in the transcript.\n"
+        "Respond ONLY in valid JSON:\n"
         "{\n"
         '  "rootCause": "...",\n'
         '  "evidence": ["ev_..."],\n'
@@ -61,6 +81,7 @@ async def call_model_planner(transcript: str, allowed_causes: List[str], tools: 
         "}"
     )
 
+    # Do not send sensitive objects to model
     user_content = json.dumps({
         "transcript": transcript,
         "allowedRootCauses": allowed_causes,
@@ -85,7 +106,7 @@ async def call_model_planner(transcript: str, allowed_causes: List[str], tools: 
     }
 
     try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
+        async with httpx.AsyncClient(timeout=14.0) as client:
             resp = await client.post(url, headers=headers, json=payload)
             if resp.status_code == 200:
                 content = resp.json()["choices"][0]["message"]["content"]
@@ -103,8 +124,10 @@ async def call_model_planner(transcript: str, allowed_causes: List[str], tools: 
 def build_otlp_trace(run: Dict[str, Any]) -> Dict[str, Any]:
     trace_id = run["trace_id"]
     server_span_id = run["server_span_id"]
+    agent_span_id = run.get("agent_span_id", generate_hex(16))
     run_id = run["runId"]
     public_marker = run["publicMarker"]
+    agent_name = run.get("agentName", "incident-response")
     start_nano = run["start_nano"]
     end_nano = run.get("end_nano", start_nano + 50_000_000)
 
@@ -115,7 +138,7 @@ def build_otlp_trace(run: Dict[str, Any]) -> Dict[str, Any]:
 
     spans = []
 
-    # 1. SERVER Span
+    # 1. SERVER Span: POST /v2/incidents (kind=2)
     spans.append({
         "traceId": trace_id,
         "spanId": server_span_id,
@@ -126,12 +149,24 @@ def build_otlp_trace(run: Dict[str, Any]) -> Dict[str, Any]:
         "attributes": base_attrs
     })
 
-    # 2. CLIENT chat incident-plan
+    # 2. INTERNAL Span: invoke_agent <agentName> (kind=1)
+    spans.append({
+        "traceId": trace_id,
+        "spanId": agent_span_id,
+        "parentSpanId": server_span_id,
+        "name": f"invoke_agent {agent_name}",
+        "kind": 1,
+        "startTimeUnixNano": str(start_nano + 500_000),
+        "endTimeUnixNano": str(end_nano - 500_000),
+        "attributes": base_attrs
+    })
+
+    # 3. CLIENT Span: chat incident-plan (kind=3)
     chat_span_id = run.get("chat_span_id", generate_hex(16))
     spans.append({
         "traceId": trace_id,
         "spanId": chat_span_id,
-        "parentSpanId": server_span_id,
+        "parentSpanId": agent_span_id,
         "name": "chat incident-plan",
         "kind": 3,
         "startTimeUnixNano": str(start_nano + 1_000_000),
@@ -142,7 +177,7 @@ def build_otlp_trace(run: Dict[str, Any]) -> Dict[str, Any]:
         ]
     })
 
-    # 3. Executed Tool Spans
+    # 4. Tool Execution Spans
     diag_internal_spans = []
     for d in run.get("actionLog", []):
         act_id = d["actionId"]
@@ -151,35 +186,36 @@ def build_otlp_trace(run: Dict[str, Any]) -> Dict[str, Any]:
         phase = d.get("phase", "diagnostic")
         attempt = d.get("attempt", 1)
 
+        # INTERNAL execute_tool <toolName>
         internal_span_id = d.get("internalSpanId", generate_hex(16))
         spans.append({
             "traceId": trace_id,
             "spanId": internal_span_id,
-            "parentSpanId": server_span_id,
+            "parentSpanId": agent_span_id,
             "name": f"execute_tool {tool_name}",
             "kind": 1,
             "startTimeUnixNano": str(start_nano + 12_000_000),
             "endTimeUnixNano": str(end_nano - 5_000_000),
             "attributes": base_attrs + [
-                {"key": "ga5.action.id", "value": {"stringValue": act_id}},
-                {"key": "gen_ai.tool.name", "value": {"stringValue": tool_name}},
-                {"key": "gen_ai.tool.call.id", "value": {"stringValue": call_id}},
+                {"key": "ga5.action.id", "value": {"stringValue": str(act_id)}},
+                {"key": "gen_ai.tool.name", "value": {"stringValue": str(tool_name)}},
+                {"key": "gen_ai.tool.call.id", "value": {"stringValue": str(call_id)}},
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}}
             ]
         })
         if phase == "diagnostic":
             diag_internal_spans.append(internal_span_id)
 
-        # Matching CLIENT span for dispatch
+        # CLIENT POST tool/<toolName>
         client_span_id = d["traceparent"].split("-")[2]
         rc = [r for r in run.get("receiptLog", []) if r.get("actionId") == act_id and r.get("attempt") == attempt]
         rc_item = rc[0] if rc else {}
 
         client_attrs = base_attrs + [
-            {"key": "ga5.action.id", "value": {"stringValue": act_id}},
-            {"key": "ga5.attempt", "value": {"intValue": attempt}},
+            {"key": "ga5.action.id", "value": {"stringValue": str(act_id)}},
+            {"key": "ga5.attempt", "value": {"intValue": int(attempt)}},
             {"key": "http.request.method", "value": {"stringValue": "POST"}},
-            {"key": "http.request.resend_count", "value": {"intValue": attempt - 1}}
+            {"key": "http.request.resend_count", "value": {"intValue": int(attempt - 1)}}
         ]
         if "receiptId" in rc_item:
             client_attrs.append({"key": "ga5.receipt.id", "value": {"stringValue": str(rc_item["receiptId"])}})
@@ -206,12 +242,12 @@ def build_otlp_trace(run: Dict[str, Any]) -> Dict[str, Any]:
 
         spans.append(client_span)
 
-    # 4. Fan-In incident.join Span
+    # 5. INTERNAL incident.join Span
     if len(diag_internal_spans) > 1:
         spans.append({
             "traceId": trace_id,
             "spanId": generate_hex(16),
-            "parentSpanId": server_span_id,
+            "parentSpanId": agent_span_id,
             "name": "incident.join",
             "kind": 1,
             "startTimeUnixNano": str(start_nano + 25_000_000),
@@ -220,13 +256,13 @@ def build_otlp_trace(run: Dict[str, Any]) -> Dict[str, Any]:
             "links": [{"traceId": trace_id, "spanId": sid} for sid in diag_internal_spans]
         })
 
-    # 5. Approval Gate Span
+    # 6. INTERNAL approval_gate Span
     if run.get("approval_info") and run["approval_info"].get("nonce"):
         app_info = run["approval_info"]
         spans.append({
             "traceId": trace_id,
             "spanId": generate_hex(16),
-            "parentSpanId": server_span_id,
+            "parentSpanId": agent_span_id,
             "name": "approval_gate",
             "kind": 1,
             "startTimeUnixNano": str(start_nano + 30_000_000),
@@ -259,11 +295,9 @@ async def create_or_replay_incident(request: Request):
     if not run_id:
         raise HTTPException(status_code=400, detail="Missing runId")
 
-    # Clean payload striping for canonical equality check
     request_for_canon = {k: v for k, v in body.items() if k != "sensitive"}
     canon_body = canonical_json_str(request_for_canon)
 
-    # State Check (Conflict vs Replay)
     if run_id in RUNS_DB:
         existing = RUNS_DB[run_id]
         if existing["canon_request"] != canon_body:
@@ -273,17 +307,20 @@ async def create_or_replay_incident(request: Request):
     tp_info = parse_traceparent(request.headers.get("traceparent"))
     trace_id = tp_info["trace_id"] if tp_info else generate_hex(32)
     server_span_id = tp_info["parent_span_id"] if tp_info else generate_hex(16)
+    agent_span_id = generate_hex(16)
     start_nano = int(time.time() * 1e9)
 
     incident_data = body.get("incident", {})
     policy = body.get("policy", {})
     tools = body.get("toolCatalog", [])
+    agent_name = body.get("agentName", "incident-response")
 
     allowed_causes = incident_data.get("allowedRootCauses", [])
     model_res = await call_model_planner(
         transcript=incident_data.get("transcript", ""),
         allowed_causes=allowed_causes,
-        tools=tools
+        tools=tools,
+        agent_name=agent_name
     )
 
     root_cause = model_res.get("rootCause")
@@ -301,28 +338,36 @@ async def create_or_replay_incident(request: Request):
 
     diag_tools = [t for t in tools if t.get("name") not in policy.get("effectTools", [])]
     if not raw_calls and diag_tools:
-        raw_calls = [{"toolName": diag_tools[0]["name"], "arguments": {}, "evidence": [evidence[0]]}]
+        default_args = build_default_arguments(diag_tools[0].get("inputSchema", {}))
+        raw_calls = [{"toolName": diag_tools[0]["name"], "arguments": default_args, "evidence": [evidence[0]]}]
 
     for call in raw_calls[:max_diag]:
         tool_name = call.get("toolName")
-        if not tool_name:
+        matched_tool = next((t for t in tools if t.get("name") == tool_name), None)
+        if not matched_tool:
             continue
-            
+
         action_id = generate_hex(16)
         call_id = action_id
         client_span_id = generate_hex(16)
         internal_span_id = generate_hex(16)
 
-        call_ev = call.get("evidence", [evidence[0]])
+        call_ev = [e for e in call.get("evidence", []) if e in evidence]
         if not call_ev:
             call_ev = [evidence[0]]
+        # Deduplicate evidence
+        call_ev = list(dict.fromkeys(call_ev))
+
+        args = call.get("arguments")
+        if not args:
+            args = build_default_arguments(matched_tool.get("inputSchema", {}))
 
         disp = {
             "actionId": action_id,
             "callId": call_id,
             "phase": "diagnostic",
             "toolName": tool_name,
-            "arguments": call.get("arguments", {}),
+            "arguments": args,
             "evidence": call_ev,
             "attempt": 1,
             "traceparent": f"00-{trace_id}-{client_span_id}-01",
@@ -332,9 +377,11 @@ async def create_or_replay_incident(request: Request):
 
     run_record = {
         "runId": run_id,
+        "agentName": agent_name,
         "publicMarker": body.get("publicMarker", "default-marker"),
         "trace_id": trace_id,
         "server_span_id": server_span_id,
+        "agent_span_id": agent_span_id,
         "chat_span_id": generate_hex(16),
         "start_nano": start_nano,
         "canon_request": canon_body,
@@ -387,7 +434,7 @@ async def post_receipt(runId: str, request: Request):
 
     RECEIPTS_DB[receipt_id] = canon_receipt
 
-    # Approval Processing
+    # Process Approvals
     if "approvals" in body:
         for app_rec in body.get("approvals", []):
             decision = app_rec.get("decision")
@@ -402,12 +449,17 @@ async def post_receipt(runId: str, request: Request):
                 run["approval_info"]["nonce"] = nonce
                 effect_tool = run["pending_effect_tool"]
                 client_span_id = generate_hex(16)
+
+                effect_args = effect_tool.get("arguments")
+                if not effect_args:
+                    effect_args = build_default_arguments(effect_tool.get("inputSchema", {}))
+
                 effect_disp = {
                     "actionId": run["pending_effect_action_id"],
                     "callId": run["pending_effect_action_id"],
                     "phase": "effect",
                     "toolName": effect_tool["name"],
-                    "arguments": effect_tool.get("arguments", {}),
+                    "arguments": effect_args,
                     "evidence": run["diagnosis"]["evidence"][:1],
                     "attempt": 1,
                     "approvalId": app_rec["approvalId"],
@@ -428,7 +480,7 @@ async def post_receipt(runId: str, request: Request):
                 run["response"] = resp
                 return JSONResponse(status_code=200, content=resp)
 
-    # Outcome Processing
+    # Process Outcomes
     if "outcomes" in body:
         for outcome in body.get("outcomes", []):
             action_id = outcome["actionId"]
@@ -486,7 +538,7 @@ async def post_receipt(runId: str, request: Request):
                 run["response"] = final_resp
                 return JSONResponse(status_code=200, content=final_resp)
 
-    # Next Step: Check for Required Effect or Approvals
+    # Next Action: Diagnostic -> Effect / Approval Gate
     effect_tools = [t for t in run["toolCatalog"] if t.get("name") in run["policy"].get("effectTools", [])]
     chosen_effect = effect_tools[0] if effect_tools else None
 
@@ -497,7 +549,12 @@ async def post_receipt(runId: str, request: Request):
         if requires_approval and not run.get("approval_info"):
             app_id = generate_hex(16)
             act_id = generate_hex(16)
-            args_digest = compute_arguments_digest(chosen_effect.get("inputSchema", {}))
+            effect_args = chosen_effect.get("arguments")
+            if not effect_args:
+                effect_args = build_default_arguments(chosen_effect.get("inputSchema", {}))
+            chosen_effect["arguments"] = effect_args
+
+            args_digest = compute_arguments_digest(effect_args)
 
             run["pending_effect_action_id"] = act_id
             run["pending_effect_tool"] = chosen_effect
@@ -517,7 +574,7 @@ async def post_receipt(runId: str, request: Request):
             run["response"] = resp
             return JSONResponse(status_code=200, content=resp)
 
-    # Terminal State
+    # Completion
     run["status"] = "completed"
     run["chosenEffect"] = chosen_effect["name"] if chosen_effect else "scale_service"
     run["end_nano"] = int(time.time() * 1e9)
